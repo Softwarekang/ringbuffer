@@ -1,2 +1,2 @@
-# ringbuffer
-lock free buffer write in go
+# RingBuffer
+A lock-free thread-safe loop buffer that is specifically designed for socket scenarios.

@@ -1,12 +1,12 @@
 package ringbuffer
 
-// Buffer net in out data buffer
+// Buffer net in out p buffer
 type Buffer interface {
-	// CopyFromFd copy fd data to buffer
+	// CopyFromFd copy fd to buffer
 	CopyFromFd(fd int) (int, error)
-	// Write bytes to buffer
+	// Write bytes to buffer, return syscall.EAGAIN when the buffer capacity is insufficient
 	Write(bytes []byte) error
-	// Read buffer data to  bytes
+	// Read buffer p to  bytes
 	Read(bytes []byte) (int, error)
 	// Bytes will return buffer bytes
 	Bytes() []byte
@@ -16,7 +16,7 @@ type Buffer interface {
 	WriteString(s string) error
 	// IsEmpty will return true if buffer len is zero
 	IsEmpty() bool
-	// Release will release length n buffer data
+	// Release will release length n buffer p
 	Release(n int)
 	// Clear will clear buffer
 	Clear()
