@@ -1,13 +1,20 @@
 package ringbuffer
 
 import (
-	"math"
 	"syscall"
 )
 
 const (
 	// 64 kb
-	defaultCacheSize = 64 * 1024
+	defaultCacheSize = 64 * K
+	maxCacheSize     = 1 * G
+)
+
+const (
+	B = 1
+	K = 1024 * B
+	M = 1024 * K
+	G = 1024 * M
 )
 
 // RingBuffer lock-free cache for a read-write goroutine.
@@ -20,20 +27,198 @@ type RingBuffer struct {
 
 // NewRingBuffer .
 func NewRingBuffer(cap int) *RingBuffer {
-	if cap > math.MaxUint || cap <= 0 {
+	if cap <= 0 {
 		cap = defaultCacheSize
 	}
 
 	if (cap & (cap - 1)) != 0 {
-		cap = adjust(cap)
+		cap = min(adjust(cap), maxCacheSize)
 	}
 
 	return &RingBuffer{
-		p:   make([]byte, 0, cap),
+		p:   make([]byte, cap),
 		r:   0,
 		w:   0,
 		cap: cap,
 	}
+}
+
+// CopyFromFd .
+func (r *RingBuffer) CopyFromFd(fd int) (int, error) {
+	rr := r.r
+	if r.full(rr) {
+		return 0, syscall.EAGAIN
+	}
+
+	writeIndex, readIndex := r.index(r.w), r.index(rr)
+	if writeIndex < readIndex {
+		n, err := syscall.Read(fd, r.p[writeIndex:readIndex])
+		if err != nil {
+			return 0, err
+		}
+
+		r.w += n
+		return n, nil
+	}
+
+	bs := [][]byte{
+		r.p[writeIndex:],
+		r.p[:readIndex],
+	}
+	n, err := Readv(fd, bs)
+	if err != nil {
+		return 0, err
+	}
+
+	r.w += n
+	return n, nil
+}
+
+// Write .
+func (r *RingBuffer) Write(p []byte) (int, error) {
+	rr := r.r
+	if r.full(rr) {
+		return 0, syscall.EAGAIN
+	}
+
+	l := len(p)
+	if l <= 0 {
+		return 0, nil
+	}
+
+	writeIndex, readIndex := r.index(r.w), r.index(rr)
+	if writeIndex < readIndex {
+		n := copy(r.p[writeIndex:readIndex], p)
+		r.w += n
+		return n, nil
+	}
+
+	writeableSize := min(r.cap+readIndex-writeIndex, l)
+	n := copy(r.p[writeIndex:], p)
+	if n < writeableSize {
+		n += copy(r.p[:readIndex], p[n:])
+	}
+
+	r.w += n
+	return n, nil
+}
+
+// Read .
+func (r *RingBuffer) Read(p []byte) (int, error) {
+	rw := r.w
+	if rw == r.r {
+		return 0, syscall.EAGAIN
+	}
+
+	l := len(p)
+	if l <= 0 {
+		return 0, nil
+	}
+
+	writeIndex, readIndex := r.index(rw), r.index(r.r)
+	if readIndex < writeIndex {
+		n := copy(p, r.p[readIndex:writeIndex])
+		r.r += n
+		return n, nil
+	}
+
+	readableSize := min(r.readableSize(rw), l)
+	n := copy(p, r.p[readIndex:])
+	if n < readableSize {
+		n += copy(p[n:], r.p[:readIndex])
+	}
+
+	r.r += n
+	return n, nil
+}
+
+// Bytes .
+func (r *RingBuffer) Bytes() []byte {
+	var zeroBytes []byte
+	rw := r.w
+	if rw == r.r {
+		return zeroBytes
+	}
+	readableSize := r.readableSize(rw)
+	p := make([]byte, readableSize)
+	writeIndex, readIndex := r.index(rw), r.index(r.r)
+	if readIndex < writeIndex {
+		copy(p, r.p[readIndex:writeIndex])
+		return p
+	}
+
+	n := copy(p, r.p[readIndex:])
+	if n < readableSize {
+		copy(p[n:], r.p[:readIndex])
+	}
+
+	return p
+}
+
+// Len .
+func (r *RingBuffer) Len() int {
+	return r.readableSize(r.w)
+}
+
+// WriteString .
+func (r *RingBuffer) WriteString(s string) (int, error) {
+	return r.Write([]byte(s))
+}
+
+// IsEmpty .
+func (r *RingBuffer) IsEmpty() bool {
+	return r.r == r.w
+}
+
+// Release .
+func (r *RingBuffer) Release(n int) {
+	rw := r.w
+	releasableSize := rw - r.r
+	if releasableSize == 0 {
+		return
+	}
+
+	if n > releasableSize {
+		r.r = rw
+		return
+	}
+
+	r.r += n
+}
+
+// Cap .
+func (r *RingBuffer) Cap() int {
+	return r.cap
+}
+
+// Clear .
+func (r *RingBuffer) Clear() {
+	r.r, r.w, r.cap, r.p = 0, 0, 0, nil
+}
+
+func (r *RingBuffer) full(rr int) bool {
+	if r.w-rr == r.cap {
+		return true
+	}
+
+	return false
+}
+
+func (r *RingBuffer) readableSize(rw int) int {
+	if rw == r.r {
+		return 0
+	}
+
+	writeIndex, readIndex := r.index(rw), r.index(r.r)
+	if writeIndex > readIndex {
+		return writeIndex - readIndex
+	}
+
+	return r.cap + writeIndex - readIndex
+}
+
+func (r *RingBuffer) index(i int) int {
+	return i & (r.cap - 1)
 }
 
 func adjust(n int) int {
@@ -43,133 +228,6 @@ func adjust(n int) int {
 	n |= n >> 8
 	n |= n >> 16
 	return n + 1
-}
-
-// CopyFromFd .
-func (r *RingBuffer) CopyFromFd(fd int) (int, error) {
-	if r.full() {
-		return 0, syscall.EAGAIN
-	}
-
-	if r.r > r.w {
-		return syscall.Read(fd, r.p[r.w:r.r])
-	}
-
-	bs := [][]byte{
-		r.p[r.w:],
-		r.p[:r.r],
-	}
-	return Readv(fd, bs)
-}
-
-// Write .
-func (r *RingBuffer) Write(p []byte) error {
-	if r.full() {
-		return syscall.EAGAIN
-	}
-
-	l := len(p)
-	if l <= 0 {
-		return nil
-	}
-
-	// return syscall.EAGAIN when the buffer capacity is insufficient.
-	if r.writeableSize() < l {
-		return syscall.EAGAIN
-	}
-
-	n := copy(p, r.p[r.w:])
-	if n < l {
-		copy(p[n:], r.p)
-	}
-
-	r.w += l
-	return nil
-}
-
-// Read .
-func (r *RingBuffer) Read(p []byte) (int, error) {
-	if r.empty() {
-		return 0, syscall.EAGAIN
-	}
-
-	l := len(p)
-	if l <= 0 {
-		return 0, nil
-	}
-
-	if r.r < r.w {
-		return copy(p, r.p[r.r:r.w]), nil
-	}
-
-	readableSize := min(r.readableSize(), l)
-	n := copy(p, r.p[r.r:])
-	if n < l {
-		copy(p[n:], r.p[:readableSize-n])
-	}
-
-	return readableSize, nil
-}
-
-// Bytes .
-func (r *RingBuffer) Bytes() []byte {
-	p := make([]byte, r.cap)
-	i := copy(p, r.p[r.w:])
-	copy(p[i:], r.p[:i])
-	return p
-}
-
-// Len .
-func (r *RingBuffer) Len() int {
-	return r.readableSize()
-}
-
-// WriteString .
-func (r *RingBuffer) WriteString(s string) error {
-	return r.Write([]byte(s))
-}
-
-// IsEmpty .
-func (r *RingBuffer) IsEmpty() bool {
-	return r.readableSize() == 0
-}
-
-// Release .
-func (r *RingBuffer) Release(n int) {
-	if r.readableSize() < n {
-		r.r = r.w
-		return
-	}
-
-	r.r += n
-}
-
-// Clear .
-func (r *RingBuffer) Clear() {
-	r.r, r.w, r.cap, r.p = 0, 0, 0, nil
-}
-
-func (r *RingBuffer) full() bool {
-	if r.r == (r.w+1)%r.cap {
-		return true
-	}
-
-	return false
-}
-
-func (r *RingBuffer) empty() bool {
-	return r.r == r.w
-}
-
-func (r *RingBuffer) writeableSize() int {
-	if r.w > r.r {
-		return r.cap + r.r - r.w
-	}
-	return r.r - r.w
-}
-
-func (r *RingBuffer) readableSize() int {
-	return r.cap - r.writeableSize()
 }
 
 func min(a, b int) int {
