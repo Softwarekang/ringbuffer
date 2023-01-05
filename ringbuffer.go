@@ -26,7 +26,12 @@ type RingBuffer struct {
 }
 
 // NewRingBuffer .
-func NewRingBuffer(cap int) *RingBuffer {
+func NewRingBuffer() *RingBuffer {
+	return NewRingBufferWithCap(defaultCacheSize)
+}
+
+// NewRingBufferWithCap .
+func NewRingBufferWithCap(cap int) *RingBuffer {
 	if cap <= 0 {
 		cap = defaultCacheSize
 	}
@@ -125,7 +130,7 @@ func (r *RingBuffer) Read(p []byte) (int, error) {
 	readableSize := min(r.readableSize(rw), l)
 	n := copy(p, r.p[readIndex:])
 	if n < readableSize {
-		n += copy(p[n:], r.p[:readIndex])
+		n += copy(p[n:], r.p[:writeIndex])
 	}
 
 	r.r += n
