@@ -5,9 +5,10 @@ import (
 )
 
 const (
-	// 64 kb
+	// defaultCacheSize default cache size 64 kb
 	defaultCacheSize = 64 * K
-	maxCacheSize     = 1 * G
+	// maxCacheSize max cache size 1 GB
+	maxCacheSize = 1 * G
 )
 
 const (
@@ -76,6 +77,35 @@ func (r *RingBuffer) CopyFromFd(fd int) (int, error) {
 	}
 
 	r.w += n
+	return n, nil
+}
+
+// WriteToFd .
+func (r *RingBuffer) WriteToFd(fd int) (int, error) {
+	rw := r.w
+	if rw == r.r {
+		return 0, syscall.EAGAIN
+	}
+
+	writeIndex, readIndex := r.index(rw), r.index(r.r)
+	if readIndex < writeIndex {
+		n, err := syscall.Write(fd, r.p[readIndex:writeIndex])
+		if err != nil {
+			return 0, err
+		}
+		r.r += n
+		return n, nil
+	}
+
+	bs := [][]byte{
+		r.p[readIndex:],
+		r.p[:writeIndex],
+	}
+	n, err := Writev(fd, bs)
+	if err != nil {
+		return 0, err
+	}
+	r.r += n
 	return n, nil
 }
 
@@ -202,11 +232,7 @@ func (r *RingBuffer) Clear() {
 }
 
 func (r *RingBuffer) full(rr int) bool {
-	if r.w-rr == r.cap {
-		return true
-	}
-
-	return false
+	return r.w-rr == r.cap
 }
 
 func (r *RingBuffer) readableSize(rw int) int {
@@ -239,5 +265,6 @@ func min(a, b int) int {
 	if a < b {
 		return a
 	}
+
 	return b
 }
